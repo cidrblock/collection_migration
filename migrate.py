@@ -1038,7 +1038,7 @@ def copy_unit_tests(copy_map, collection_dir, checkout_path):
 
 
 # ===== MAKE COLLECTIONS =====
-def assemble_collections(checkout_path, spec, args, target_github_org):
+def assemble_collections(checkout_path, spec, args):
     collections_base_dir = os.path.join(args.vardir, 'collections')
 
     # expand globs so we deal with specific paths
@@ -1053,13 +1053,15 @@ def assemble_collections(checkout_path, spec, args, target_github_org):
 
     seen = {}
     for namespace in spec.keys():
-        for collection in spec[namespace].keys():
-            import_deps = []
-            docs_deps = []
-            unit_deps = []
-            integration_test_dirs = []
-            migrated_to_collection = {}
-            unit_tests_copy_map = {}
+        for collection, collection_details in spec[namespace].items():
+            collection_details['meta'] = {}
+            collection_details['meta']['collection_dir'] = os.path.join(collections_base_dir, 'ansible_collections', namespace, collection)
+            collection_details['meta']['docs_deps'] = []
+            collection_details['meta']['import_deps'] = []
+            collection_details['meta']['unit_deps'] = []
+            collection_details['meta']['migrated_to_collection'] = {}
+            collection_details['meta']['integration_test_dirs'] = []
+            collection_details['meta']['unit_tests_copy_map'] = {}
 
             if args.fail_on_core_rewrite:
                 if collection != '_core':
@@ -1069,20 +1071,22 @@ def assemble_collections(checkout_path, spec, args, target_github_org):
                     # these are info only collections
                     continue
 
-            collection_dir = os.path.join(collections_base_dir, 'ansible_collections', namespace, collection)
-
             if not COLLECTION_SKIP_BUILD:
-                if args.refresh and os.path.exists(collection_dir):
-                    shutil.rmtree(collection_dir)
+                if args.refresh and os.path.exists(collection_details['meta']['collection_dir']):
+                    shutil.rmtree(collection_details['meta']['collection_dir'])
 
-                if not os.path.exists(collection_dir):
-                    os.makedirs(collection_dir)
+                if not os.path.exists(collection_details['meta']['collection_dir']):
+                    os.makedirs(collection_details['meta']['collection_dir'])
 
             # create the data for galaxy.yml
-            galaxy_metadata = init_galaxy_metadata(collection, namespace, target_github_org)
+            collection_details['meta']['galaxy_metadata'] = init_galaxy_metadata(collection, namespace, args.target_github_org)
 
             # process each plugin type
+
             for plugin_type, plugins in spec[namespace][collection].items():
+                if plugin_type == "meta":
+                    continue
+
                 if not plugins:
                     logger.error('Empty plugin_type: %s in spec for %s.%s', plugin_type, namespace, collection)
                     continue
@@ -1092,7 +1096,7 @@ def assemble_collections(checkout_path, spec, args, target_github_org):
 
                 # ensure destinations exist
                 relative_dest_plugin_base = os.path.join('plugins', plugin_type)
-                dest_plugin_base = os.path.join(collection_dir, relative_dest_plugin_base)
+                dest_plugin_base = os.path.join(collection_details['meta']['collection_dir'], relative_dest_plugin_base)
 
                 if not os.path.exists(dest_plugin_base) and not COLLECTION_SKIP_BUILD:
                     os.makedirs(dest_plugin_base)
@@ -1148,10 +1152,10 @@ def assemble_collections(checkout_path, spec, args, target_github_org):
                         plugin_path_chunk = plugin if do_preserve_subdirs else os.path.basename(plugin)
 
                     relative_dest_plugin_path = os.path.join(relative_dest_plugin_base, plugin_path_chunk)
-                    migrated_to_collection[relative_src_plugin_path] = relative_dest_plugin_path
+                    collection_details['meta']['migrated_to_collection'][relative_src_plugin_path] = relative_dest_plugin_path
 
                     if not COLLECTION_SKIP_BUILD:
-                        dest = os.path.join(collection_dir, relative_dest_plugin_path)
+                        dest = os.path.join(collection_details['meta']['collection_dir'], relative_dest_plugin_path)
                         if do_preserve_subdirs:
                             os.makedirs(os.path.dirname(dest), exist_ok=True)
 
@@ -1172,8 +1176,8 @@ def assemble_collections(checkout_path, spec, args, target_github_org):
                         logger.info('Processing %s -> %s', src, dest)
 
                         deps = rewrite_py(src, dest, collection, spec, namespace, args)
-                        import_deps += deps[0]
-                        docs_deps += deps[1]
+                        collection_details['meta']['import_deps'] += deps[0]
+                        collection_details['meta']['docs_deps'] += deps[1]
 
                         if args.skip_tests:
                             continue
@@ -1189,69 +1193,81 @@ def assemble_collections(checkout_path, spec, args, target_github_org):
                             plugin = plugin.replace(depr_name, new_name)
                             plugins[idx] = plugin
 
-                        integration_test_dirs.extend(poor_mans_integration_tests_discovery(checkout_path, plugin_type, plugin))
+                        collection_details['meta']['integration_test_dirs'].extend(poor_mans_integration_tests_discovery(checkout_path, plugin_type, plugin))
 
                         # process unit tests
                         plugin_unit_tests_copy_map = create_unit_tests_copy_map(
-                            checkout_path, collection_dir, plugin_type, plugin,
+                            checkout_path, collection_details['meta']['collection_dir'], plugin_type, plugin,
                         )
-                        unit_tests_copy_map.update(plugin_unit_tests_copy_map)
+                        collection_details['meta']['unit_tests_copy_map'].update(plugin_unit_tests_copy_map)
+    return spec
 
-            if not args.skip_tests:
-                copy_unit_tests(unit_tests_copy_map, collection_dir, checkout_path)
-                migrated_to_collection.update(unit_tests_copy_map)
+def process_tests(checkout_path, spec, args):
+    # after the file migration has taken place, iterate the collections and perform the test fixes
+    if not args.skip_tests:
+        for namespace in spec.keys():
+            for collection, collection_details in spec[namespace].items():
+                print(collection, collection_details)
+
+                copy_unit_tests(collection_details['meta']['unit_tests_copy_map'], collection_details['meta']['collection_dir'], checkout_path)
+                collection_details['meta']['migrated_to_collection'].update(collection_details['meta']['unit_tests_copy_map'])
 
                 inject_init_into_tree(
-                    os.path.join(collection_dir, 'tests', 'unit'),
+                    os.path.join(collection_details['meta']['collection_dir'], 'tests', 'unit'),
                 )
 
-                unit_deps += rewrite_unit_tests(collection_dir, collection, spec, namespace, args)
+                collection_details['meta']['unit_deps'] += rewrite_unit_tests(collection_details['meta']['collection_dir'], collection, spec, namespace, args)
 
-                inject_gitignore_into_tests(collection_dir)
+
+                inject_gitignore_into_tests(collection_details['meta']['collection_dir'])
 
                 inject_ignore_into_sanity_tests(
-                    checkout_path, collection_dir, migrated_to_collection,
+                    checkout_path, collection_details['meta']['collection_dir'], collection_details['meta']['migrated_to_collection'],
                 )
-                inject_requirements_into_sanity_tests(checkout_path, collection_dir)
+                inject_requirements_into_sanity_tests(checkout_path, collection_details['meta']['collection_dir'])
 
                 # FIXME need to hack PyYAML to preserve formatting (not how much it's possible or how much it is work) or use e.g. ruamel.yaml
                 try:
-                    migrated_integration_test_files = rewrite_integration_tests(integration_test_dirs, checkout_path, collection_dir, namespace, collection, spec, args)
-                    migrated_to_collection.update(migrated_integration_test_files)
+                    migrated_integration_test_files = rewrite_integration_tests(collection_details['meta']['integration_test_dirs'], checkout_path, collection_details['meta']['collection_dir'], namespace, collection, spec, args)
+                    collection_details['meta']['migrated_to_collection'].update(migrated_integration_test_files)
                 except yaml.composer.ComposerError as e:
                     logger.error(e)
 
                 global integration_tests_deps
-                add_deps_to_metadata(integration_tests_deps.union(import_deps + docs_deps + unit_deps), galaxy_metadata)
+                add_deps_to_metadata(integration_tests_deps.union(collection_details['meta']['import_deps'] + collection_details['meta']['docs_deps'] + collection_details['meta']['unit_deps']), collection_details['meta']['galaxy_metadata'])
                 integration_tests_deps = set()
 
+
+def finalize_collection_build(checkout_path, spec, args):
+    for namespace in spec.keys():
+        for collection, collection_details in spec[namespace].items():
             if not COLLECTION_SKIP_BUILD:
-                inject_gitignore_into_collection(collection_dir)
+                inject_gitignore_into_collection(collection_details['meta']['collection_dir'])
                 inject_readme_into_collection(
-                    collection_dir,
+                    collection_details['meta']['collection_dir'],
                     ctx={'coll_ns': namespace, 'coll_name': collection},
                 )
                 inject_github_actions_workflow_into_collection(
-                    collection_dir,
+                    collection_details['meta']['collection_dir'],
                     ctx={'coll_ns': namespace, 'coll_name': collection},
                 )
 
                 # write collection metadata
                 write_yaml_into_file_as_is(
-                    os.path.join(collection_dir, 'galaxy.yml'),
-                    galaxy_metadata,
+                    os.path.join(collection_details['meta']['collection_dir'], 'galaxy.yml'),
+                    collection_details['meta']['galaxy_metadata'],
                 )
 
                 # init git repo
-                subprocess.check_call(('git', 'init'), cwd=collection_dir)
-                subprocess.check_call(('git', 'add', '.'), cwd=collection_dir)
+                subprocess.check_call(('git', 'init'), cwd=collection_details['meta']['collection_dir'])
+                subprocess.check_call(('git', 'add', '.'), cwd=collection_details['meta']['collection_dir'])
                 subprocess.check_call(
                     ('git', 'commit', '-m', 'Initial commit', '--allow-empty'),
-                    cwd=collection_dir,
+                    cwd=collection_details['meta']['collection_dir'],
                 )
 
             mark_moved_resources(
-                checkout_path, namespace, collection, migrated_to_collection,
+                checkout_path, namespace, collection, collection_details['meta']['migrated_to_collection'],
             )
 
             if args.move_plugins:
@@ -2014,8 +2030,11 @@ def main():
     global ALL_THE_FILES
     ALL_THE_FILES = checkout_repo(DEVEL_URL, devel_path, refresh=args.refresh)
 
-    # doeet
-    assemble_collections(devel_path, spec, args, args.target_github_org)
+    # the spec may have been modifed if depracated files were renamed
+    # run the migration prior to running the tests
+    spec = assemble_collections(devel_path, spec, args)
+    process_tests(devel_path, spec, args)
+    finalize_collection_build(devel_path, spec, args)
 
     if args.publish_to_github:
         publish_to_github(
